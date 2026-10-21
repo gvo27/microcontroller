@@ -21,6 +21,13 @@ laptop (Python CLI)  --USB-->  ESP32-S3  --PWM-->  DS3225 steering servo
   test, calibrate, teleop).
 - Pins for the future battery-low input, IMU, distance sensor and shaft encoder are
   **reserved and documented only**. No code drives them.
+- **The ESP32 powers nothing.** Its only jobs are outputting actuator signals and talking
+  to the host computer. Sensors will get power from a separate, tightly regulated sensor
+  rail. Their *signal* wires may later land on the reserved pins, with a common ground
+  and ≤ 3.3 V logic guaranteed by that rail's design.
+- Tuning lives in one root file (`tuning.toml`), pushed to the ESP32 at runtime, so most
+  adjustments need no firmware edit or reflash. Every session is logged to `logs/` for
+  later analysis.
 - Later the laptop is replaced by a Raspberry Pi 5 running ROS 2. The firmware is split
   so that only its comms layer changes then (see [section 10](#10-future-ros-2-migration)).
 
@@ -149,6 +156,10 @@ writes the requested command, so a slow or blocked serial port cannot disturb pu
               └─ throttle lead:  signal ──▶ GPIO5
                                  red 6V ──▶ servo red     (servo power, Y-harness)
                                  black  ──▶ servo black ──▶ ESP32 GND (P1-22)
+
+ 2S LiPo ──▶ sensor power rail (separate, regulated; future)
+              ├─▶ IMU / LIDAR / encoder / battery-monitor VCC
+              └─ GND ──▶ common ground (P1-22)          signals ≤ 3.3 V ──▶ reserved pins
 ```
 
 Rules:
@@ -162,9 +173,13 @@ Rules:
 3. The ESC BEC (6 V / 3 A) covers the servo (2.3 A stall at 6.8 V, about 2.1 A at 6 V). This
    is the normal RC-car setup and meets the datasheet's "dedicated BEC" advice. Do not
    power the servo from the Pi 5 rail later either.
-4. 5 V sensors added later (LIDAR-Lite v4) need their own 5 V supply, such as the Pololu
-   D36V50F5 rail planned for the Pi, sharing ground. The board's `5V` pin is an *input* by
-   default and cannot supply them.
+4. **Sensors are powered by a separate, tightly regulated sensor rail, never by the
+   ESP32.** That includes 3.3 V parts: the `3V3` pins stay unused. This keeps sensor
+   current spikes off the MCU's regulator and lets the rail be filtered and sequenced
+   independently. (The board's `5V` pin could not supply them anyway: it is an *input* by
+   default.) The rail shares ground with the ESP32. Any sensor output that reaches an
+   ESP32 pin must be ≤ 3.3 V. This should be a design requirement for the rail
+   (level-shift on the rail side).
 
 ## 5. Pin plan (left header P1 only, verified)
 
@@ -175,8 +190,8 @@ This matches the P1 table in the vendor guide and Espressif's DevKitC-1 J1 heade
 
 | P1 # | Label | GPIO capabilities (vendor table) | Assignment | Status |
 | --- | --- | --- | --- | --- |
-| 1 | 3V3 | 3.3 V out (LDO, 1 A total) | 3.3 V for IMU / 3.3 V sensors | power |
-| 2 | 3V3 | 3.3 V out | — | power |
+| 1 | 3V3 | 3.3 V out (LDO, 1 A total) | not used (sensors use their own rail) | power |
+| 2 | 3V3 | 3.3 V out | not used | power |
 | 3 | RST | EN (reset) | **do not use** | — |
 | 4 | 4 | ADC1_CH3, TOUCH4 | **STEER_PWM** → DS3225 signal | **active** |
 | 5 | 5 | ADC1_CH4, TOUCH5 | **THROTTLE_PWM** → ESC signal | **active** |
@@ -214,20 +229,23 @@ Why these choices:
 - The right header (P2) is unused for now. It holds GPIO0/45 (strapping), GPIO19/20
   (native USB), GPIO35-37 (PSRAM), GPIO43/44 (COM port UART), and GPIO48 (RGB LED pad).
 
-Notes for the reserved devices (wiring guidance only, no code in this PR):
+Notes for the reserved devices (wiring guidance only, no code in this PR). Each device's
+**power** comes from the sensor rail (rule 4 above). These notes cover only what its
+*signal* lines need before they reach an ESP32 pin.
 - **Battery hi/low.** A 2S pack reaches 8.4 V, so **never** wire it directly to a pin.
   A bare resistor divider does not give a clean hi/low either: ESP32 inputs read
   undefined between about 0.8 V and 2.5 V. Use a comparator or voltage-detector module
   set to about 6.8 V (3.4 V per cell, above the ESC's 6.0 V cutoff), with an open-drain
   output pulled up to 3.3 V. GPIO6 is ADC-capable, so we can switch to a divider plus
   analog reading later.
-- **IMU (6-axis).** Most breakouts (MPU-6050, ICM-42688, BMI270, LSM6DS3) run on 3.3 V
-  I2C. Power it from P1-1, use SDA/SCL as above and INT on GPIO7.
+- **IMU (6-axis).** Most breakouts (MPU-6050, ICM-42688, BMI270, LSM6DS3) use 3.3 V I2C.
+  Power it from the sensor rail, use SDA/SCL as above and INT on GPIO7. I2C pull-ups go
+  to 3.3 V.
 - **LIDAR-Lite v4 LED.** Garmin's manual could not be downloaded from this environment.
   From memory, it runs on 4.75-5.25 V with 3.3 V I2C logic at 0x62. **Verify against the
-  manual before wiring.** It needs an external 5 V supply (see power rule 4).
-- **Ultrasonic (HC-SR04 type).** Runs on 5 V and its ECHO output is 5 V, so add a 1 kΩ/2 kΩ
-  divider into GPIO11.
+  manual before wiring.** It is powered from the sensor rail's 5 V output.
+- **Ultrasonic (HC-SR04 type).** Runs on 5 V (sensor rail) and its ECHO output is 5 V, so
+  add a 1 kΩ/2 kΩ divider (or the rail's level shifter) into GPIO11.
 - **Shaft encoder.** If the outputs are open-collector, pull up to **3.3 V**, not 5 V.
 
 ### 5.1 README marking plan
@@ -241,7 +259,7 @@ The implementation PR adds a root `README.md` with:
                 ESP32-S3-N16R8   (top view, antenna up)
           P1 (LEFT header)
         ┌─────┬──────────────────────────────┐
-  3V3   │  1  │ 3.3V out → IMU VCC (future)  │
+  3V3   │  1  │ unused (sensors: own rail)   │
   3V3   │  2  │                              │
   RST   │  3  │ ✗ do not use                 │
   GPIO4 │  4  │ ● STEER_PWM   → servo signal │
@@ -283,12 +301,18 @@ The implementation PR adds a root `README.md` with:
 - Absolute clamp: 500-2500 us, from the datasheet. This applies even in raw calibration mode.
 - Drive-mode clamp: between the **calibrated** `left` and `right` pulses. These are the
   firmware end stops the servo notes ask for, so the linkage is never driven into a stall.
-- Frame rate can later go up to 330 Hz (datasheet) for lower latency. That is a one-line
-  change (`SERVO_HZ`), because the servo has its own timer.
+- The frame rate is **runtime-tunable** from 50 to 330 Hz (`servo_hz` in `tuning.toml`)
+  because the servo has its own LEDC timer. The firmware calls `ledc_set_freq()` live, and
+  pulse widths are recomputed for the new period. The board always boots at 50 Hz, then
+  applies the saved rate. See the [latency budget](#94-tuning-file-tuningtoml).
 
 ### 6.2 ESC (GPIO5)
 
-- 50 Hz, 1000 / **1500** / 2000 us (reverse-full / neutral / forward-full).
+- 50 Hz, 1000 / **1500** / 2000 us (reverse-full / neutral / forward-full). All four
+  values are tunable (`esc_hz`, `esc_min_us`, `esc_neutral_us`, `esc_max_us`). The
+  firmware enforces a 900-2100 us hard window and `min < neutral < max`. Leave `esc_hz` at
+  50 unless the ESC is confirmed to accept faster frames: many RC ESCs only accept
+  50-60 Hz input.
 - The ESC auto-calibrates its throttle range and learns *neutral at power-on*. The
   firmware therefore outputs **1500 us from the first line of `setup()`**, before Serial
   even starts.
@@ -342,6 +366,7 @@ pulse_us =  ⎨
 | Servo stalled against linkage | Drive mode is clamped to the calibrated end stops. Raw mode is clamped to the datasheet's 500-2500 us. Calibration help says to stop before the servo buzzes. |
 | Too fast on the bench | `limit` 0.30 default. `make test-throttle` asks you to type `yes` after confirming the wheels are off the ground. |
 | Bad calibration saved | `SAVE` refuses unless `center` lies between `left` and `right`. |
+| Bad tuning value | Every `SET` is range-clamped in firmware. ESC endpoint changes that would break `min < neutral < max` are rejected with `ERR`, and the CLI aborts and names the offending `tuning.toml` line. |
 
 **Power-up sequence** (goes in the README):
 1. ESC switch **OFF**. Put the car on a stand with the wheels off the ground.
@@ -368,10 +393,11 @@ to type in `make monitor` and easy to parse from Python.
 | — | `TEL t=… unix=… hdg=… spd=… steer_deg=… steer_us=… thr_us=… armed=…` | Telemetry line. |
 | `RAW <us>` / `RAW OFF` | `OK RAW <us>` | Calibration: drive the servo to an exact pulse. |
 | `CAL LEFT\|CENTER\|RIGHT <us>` | `CFG …` | Set a steering end point (RAM). |
-| `SET <key> <value>` | `CFG …` | keys: `maxdeg gain limit deadband accel timeout revmode`. |
+| `SET <key> <value>` | `CFG …` / `ERR …` | keys: `maxdeg gain limit deadband accel timeout revmode brake_ms gap_ms brake_level esc_min esc_neutral esc_max servo_hz esc_hz control_hz` (see the 9.4 mapping). |
 | `GET` | `CFG …` | Print all config. |
 | `SAVE` | `OK SAVE` / `ERR …` | Persist config to NVS. |
 | `DEFAULTS` | `CFG …` | Restore defaults (RAM, `SAVE` to persist). |
+| `SENS <name>` | `SENS <name> k=v …` / `ERR …` | **Reserved** for sensor reads (`BATT IMU DIST ENC`). Returns `ERR … not implemented` for now. |
 | `INFO` | `INFO fw=… chip=… …` | Firmware version, chip, pins. |
 | — | `READY fw=…` | Printed at boot. |
 | — | `EVT FAILSAFE …` | Command timeout fired. |
@@ -390,18 +416,27 @@ each flash. Under ROS 2, micro-ROS `rmw_uros_sync_session()` replaces this.
 ## 9. Repository layout and tooling
 
 ```
-Makefile                     # bring-up commands (below)
+CLAUDE.md                    # tiny machine-readable project map (9.7)
+Makefile                     # bring-up commands (9.2)
 README.md                    # pin map, wiring, power-up sequence
-.gitignore                   # + firmware/.pio/, __pycache__/
+tuning.toml                  # all runtime tuning, source of truth (9.4)
+.gitignore                   # + firmware/.pio/, __pycache__/, logs/*.jsonl
+.claude/
+  rules/firmware.md          # firmware rules, loaded only for firmware/** (9.7)
 docs/
   esp32-firmware-proposal.md # this file
+  hardware/                  # datasheet extracts (ds3225_servo.md, thw-1060-brushed-esc.md)
 firmware/
   platformio.ini             # board/flash/PSRAM config (currently empty in repo)
   include/pins.h             # single source of truth for pins
   src/main.cpp               # firmware
+logs/
+  .gitkeep                   # session logs land here, *.jsonl gitignored (9.6)
+test/
+  esp32_session.py           # interactive tuning / quick-test scaffold (9.5)
 tools/
   requirements.txt           # platformio, pyserial, esptool
-  rccar.py                   # laptop CLI (stdlib + pyserial)
+  rccar.py                   # CLI + shared Link / SessionLog / tuning API
 ```
 
 ### 9.1 PlatformIO config
@@ -422,9 +457,10 @@ tools/
 | Target | Does |
 | --- | --- |
 | `make setup` | create `.venv` (already gitignored), install `tools/requirements.txt` |
-| `make check` | check Python ≥ 3.9, `pyserial`, `esptool`, `pio`, and (Linux) membership of the `dialout`/`uucp` group needed to open serial ports |
+| `make check` | check Python ≥ 3.11 (for `tomllib`), that `tuning.toml` parses, `pyserial`, `esptool`, `pio`, and (Linux) membership of the `dialout`/`uucp` group needed to open serial ports |
 | `make detect` | list USB serial ports and mark the CH343 (`1a86:55d3`). If the cable is in the native port (`303a:*`), say so. Run `esptool chip_id` (should print `ESP32-S3 (QFN56) (revision v0.2)`) and query firmware `INFO` |
 | `make sync-time` | set the ESP32 clock (section 8) |
+| `make tune` | push `tuning.toml` to the ESP32 **and save it to flash**, so the car boots tuned without a laptop (and later under ROS 2) |
 | `make clean` | `rm -rf firmware/.pio` |
 | `make build` | `clean` → `pio run` |
 | `make flash` | `clean` → `pio run -t upload` over the COM port |
@@ -433,6 +469,10 @@ tools/
 | `make test-throttle` | `test` + forward / neutral / reverse at 0.5 × `limit`, after typing `yes` |
 | `make calibrate` | interactive servo calibration (below) |
 | `make teleop` | curses keyboard driving: ←/→ heading ±5°, ↑/↓ speed ±0.1, space = speed 0, `a` = arm/disarm, `q` = quit |
+| `make session` | interactive scratch session (`test/esp32_session.py`, 9.5) |
+
+Every target that connects to the ESP32 first pushes `tuning.toml` into its RAM, so
+the file on disk is what the car runs.
 
 `PORT` is auto-detected (CH343 VID:PID). Override with `make flash PORT=/dev/ttyACM0`.
 Linux shows the CH343 as `/dev/ttyACM*`, macOS as `/dev/cu.usbmodem*`, Windows as `COMx`
@@ -451,7 +491,133 @@ Linux shows the CH343 as `/dev/ttyACM*`, macOS as `/dev/cu.usbmodem*`, Windows a
    buzzing or drawing current), back off about 20 us, then type `left`. Do the same for
    `right`.
 4. Measure the wheel angle at lock with a protractor or phone app, then type `maxdeg 27`.
-5. `save`, then `q`. Finally `make test` to see the sweep using the new limits.
+5. `save` writes the values to the ESP32's flash **and back into `tuning.toml`**. Only
+   the `center_us`/`left_us`/`right_us`/`max_steer_deg`/`heading_gain` lines change, and
+   comments are kept. Commit the updated file. Then `q`, and `make test` to see the
+   sweep using the new limits.
+
+### 9.4 Tuning file (`tuning.toml`)
+
+One root file holds every adjustable number. You can tune the car without reading C++.
+
+**Why TOML.** It allows comments next to each value, Python reads it with the standard
+library (`tomllib`, Python ≥ 3.11), and the sections map naturally onto subsystems.
+Future sensor sections are already sketched in it as comments.
+
+**How values reach the car.** Nothing is compiled in:
+
+```
+tuning.toml ──(Link.apply_tuning on every connect)──▶ SET/CAL commands ──▶ ESP32 RAM
+            ──(make tune)──────────────────────────▶ … + SAVE          ──▶ ESP32 flash (NVS)
+make calibrate "save" ──▶ ESP32 flash + rewrites the steering lines in tuning.toml
+```
+
+So `tuning.toml` is the **source of truth**. Flash only holds a copy, so the car can
+boot tuned without a laptop. Keep the file in git and every tuning change gets history
+and diffs. Each session log also embeds the tuning that was active, so you can compare
+runs later.
+
+| Section | Key | Default | Firmware `SET` | Notes |
+| --- | --- | --- | --- | --- |
+| link | `send_hz` | 20 | (host only) | heartbeat/command rate |
+| link | `telemetry_hz` | 10 | `TEL` | 0-50 |
+| control | `control_hz` | 100 | `control_hz` | 20-500 |
+| safety | `cmd_timeout_ms` | 300 | `timeout` | 50-2000; keep ≥ 3 × (1000 / `send_hz`) |
+| steering | `servo_hz` | 50 | `servo_hz` | 50-330 (DS3225 datasheet) |
+| steering | `center_us` / `left_us` / `right_us` | 1500 / 1800 / 1200 | `CAL …` | written by `make calibrate` |
+| steering | `max_steer_deg` / `heading_gain` | 25.0 / 1.0 | `maxdeg` / `gain` | |
+| throttle | `esc_hz` | 50 | `esc_hz` | 50-400; leave at 50 unless ESC confirmed |
+| throttle | `esc_min_us` / `esc_neutral_us` / `esc_max_us` | 1000 / 1500 / 2000 | `esc_min` / `esc_neutral` / `esc_max` | 900-2100 hard window |
+| throttle | `speed_limit` / `deadband_us` / `accel_per_s` | 0.30 / 0 / 2.0 | `limit` / `deadband` / `accel` | |
+| throttle | `reverse_double_tap`, `brake_ms`, `gap_ms`, `brake_level` | true, 150, 150, 0.5 | `revmode`, … | ESC reverse sequence |
+| logging | `enabled`, `dir`, `log_heartbeats` | true, "logs", true | (host only) | |
+| battery / imu / distance / encoder | *commented placeholders* | — | — | e.g. `ebrake_m`, `rate_hz`, `ticks_per_rev` |
+
+**Latency budget.** This shows which knobs actually reduce delay. Worst case from a
+key press to the servo starting to move:
+
+| Stage | Default | Knob | Faster setting |
+| --- | --- | --- | --- |
+| waiting for next host send | ≤ 50 ms | `send_hz` 20 | 50 Hz → ≤ 20 ms |
+| USB + 115200 baud UART (~20 bytes) | ~2-3 ms | — | — |
+| waiting for next control tick | ≤ 10 ms | `control_hz` 100 | 200 Hz → ≤ 5 ms |
+| waiting for next PWM frame | ≤ 20 ms | `servo_hz` 50 | 200 Hz → ≤ 5 ms |
+| servo travel (0.15 s / 60° @ 5 V) | ~60-100 ms | supply voltage | 6.8 V → 0.13 s / 60° |
+
+The biggest electronic win is `send_hz` (this matters most during teleop; a ROS 2
+controller will publish at its own rate). After that come `servo_hz` and `control_hz`
+together. A faster servo frame only helps if `control_hz ≥ servo_hz`. The physical
+servo speed is the floor. A faster servo frame also raises the servo's holding current
+slightly, so watch temperature during long tests.
+
+### 9.5 Test session scaffold (`test/esp32_session.py`)
+
+This is a thin, hackable layer for tuning and quick hardware checks. It reuses the
+`Link`, `SessionLog` and tuning code from `tools/rccar.py` (imported by path), so there
+is one implementation of the protocol. The file only holds small helpers and a loop:
+
+| Helper | Does |
+| --- | --- |
+| `connect(port=None)` | open COM port, handshake, push `tuning.toml`, start log |
+| `send(cmd)` / `ask(cmd, prefix)` / `responses(seconds)` | raw send / request-reply / collect replies |
+| `set_param(key, value)` / `config()` | live-tune one value (RAM only) / read all as a dict |
+| `steer_raw(us)` / `drive(heading, speed, seconds)` | exact servo pulse / arm + stream + stop |
+| `telemetry(n)` / `latency(n)` | next n `TEL` records as dicts / USB round-trip stats |
+| `note(text)` | put a marker in the session log ("swapped to 6.8 V BEC") |
+| `read_battery()` `read_imu()` `read_distance()` `read_encoder()` | **stubs** that send `SENS <name>` and print `ERR … not implemented` until firmware support lands |
+
+The loop takes either a raw firmware command (`GET`, `SET servo_hz 100`) or a Python
+helper call prefixed with `:` (`:drive(10, 0.2, 2)`, `:telemetry(5)`). A typo prints an
+error and keeps the session alive. Raw `ARM` with no heartbeats times out after
+`cmd_timeout_ms`. That is deliberate, so use `:drive()` to move. When a sensor gets
+firmware support, its `read_*` stub starts returning a dict with no other change.
+
+### 9.6 Session logs (`logs/`)
+
+Every connection, whether from a `make` target or the session scaffold, writes one file:
+`logs/YYYYMMDD-HHMMSS_<label>.jsonl` (label = `test`, `teleop`, `calibrate`, `session`, …).
+The format is **JSON Lines**: one JSON object per line, appended as it happens. The file
+is line-buffered, so a crash loses at most the line being written. It loads straight
+into pandas:
+
+```python
+import pandas as pd
+df = pd.read_json("logs/20261021-153012_teleop.jsonl", lines=True)
+tel = pd.json_normalize(df[df.kind == "TEL"]["data"])   # t, unix, hdg, spd, steer_us, thr_us, armed
+cmds = df[(df.dir == "tx") & (df.kind == "D")]          # heartbeats / speed changes
+```
+
+| Field | Meaning |
+| --- | --- |
+| `t` | laptop wall clock (unix s); lines up with ESP32 `unix=` after `make sync-time` |
+| `mono` | laptop monotonic clock (for precise intervals; unaffected by clock changes) |
+| `dir` | `tx` (laptop → ESP32), `rx` (ESP32 → laptop), empty for local records |
+| `kind` | first token: `D`, `SET`, `TEL`, `CFG`, `EVT`, `ERR`, … plus `session` and `NOTE` |
+| `line` | the raw protocol line |
+| `data` | parsed `key=value` pairs for `TEL`, `CFG`, `INFO`, `SENS` |
+
+The first record (`kind = "session"`) captures the context: label, port, command line,
+git commit, and the **full tuning snapshot**. Any run can be traced back to the exact
+code and parameters. Today the logs mostly hold heartbeats, speed/heading changes,
+config echoes and failsafe events. Future `SENS`/telemetry fields (IMU, LIDAR, encoder)
+are parsed into `data` by the same code, with no logger changes. At 20 Hz heartbeats
+plus 10 Hz telemetry, a log grows by roughly 4 MB per hour. Set
+`log_heartbeats = false` to record only commands that change heading or speed. `*.jsonl`
+is gitignored and `logs/.gitkeep` keeps the folder. Use `git add -f` to keep a notable
+run.
+
+### 9.7 Claude Code context files
+
+- **`CLAUDE.md`** (root): a tiny, YAML-style project map (stack, goals, layout, commands,
+  invariants) meant for machines, not people. It loads in every session, so it stays a
+  few hundred tokens. People read the README.
+- **`.claude/rules/firmware.md`**: firmware implementation details (build flags,
+  architecture and safety invariants, pin rules, protocol, NVS layout, how to add a
+  sensor). Its front-matter `paths: ["firmware/**"]` means Claude Code loads it only when
+  working on files under `firmware/`. Host-side or ML work doesn't pay its context cost.
+- Both repeat the cross-file invariants: pins ↔ README, protocol ↔ CLI ↔ docs, and
+  tuning keys ↔ `FIRMWARE_KEYS` ↔ `setKey()`. Changes made with Claude then stay
+  consistent.
 
 ## 10. Future: ROS 2 migration
 
@@ -472,17 +638,25 @@ Linux shows the CH343 as `/dev/ttyACM*`, macOS as `/dev/cu.usbmodem*`, Windows a
 
 - **Pinout**: checked against the vendor's P1/P2 tables (Micro Robotics user guide, the
   link in the inventory sheet) and the ESP32-S3 strapping and PSRAM pin rules.
-- **Firmware**: `main.cpp` + `pins.h` (Appendix A) were compiled to an object file with
+- **Firmware**: `main.cpp` + `pins.h` (Appendix A, including the runtime-tunable
+  frame rates, ESC endpoints and `SENS` stub) were compiled to an object file with
   Espressif's `xtensa-esp32s3-elf-gcc` 8.4.0 (esp-2021r2-patch5) against the Arduino-ESP32
   2.0.17 core and ESP32-S3 SDK headers. Those are the versions `espressif32@6.9.0` uses,
   with the `qio_opi` memory config. Result: no errors or warnings with `-Wall -Wextra`.
   A full `pio run` (link + `firmware.bin`) **could not** run here, because this cloud
-  environment blocks the PlatformIO package registry. The first step of the
-  implementation PR is `make build` on a laptop.
-- **CLI**: `rccar.py` subcommands `ping`, `sync-time`, `test`, `calibrate`, `drive`,
-  `check-env`, `find-port` ran against a protocol mock on a pseudo-terminal. The mock
-  failsafe fired as expected.
-- **Makefile**: `make help` and `make -n` dry runs of `flash`/`clean` checked.
+  environment's network policy blocks the PlatformIO package registry
+  (`api.registry.platformio.org`, re-checked when this revision was written: still
+  rejected). The first step of the implementation PR is `make build` on a laptop.
+- **CLI**: `rccar.py` subcommands `ping`, `sync-time`, `tune`, `test`, `calibrate`,
+  `drive`, `check-env`, `find-port` ran against a protocol mock on a pseudo-terminal. The
+  mock failsafe fired as expected. `tuning.toml` was applied on connect. Calibrate's
+  `save` rewrote only the intended lines of `tuning.toml` and kept the comments.
+- **Session scaffold**: raw commands, `:latency()`, `:telemetry()`, `:drive()`, the
+  `:read_imu()` stub (`ERR … not implemented`) and a typo all behaved as described.
+- **Logs**: JSONL files were produced for each label. They parse with `json`, start with
+  a `session` record holding the tuning snapshot, and contain tx/rx/NOTE records.
+- **Makefile**: `make help` (including `tune`, `session`) and `make -n` dry runs of
+  `flash`/`clean` checked.
 - **Not verified**: anything on real hardware.
 
 ## 12. Open questions / verify on hardware
@@ -504,9 +678,169 @@ Linux shows the CH343 as `/dev/ttyACM*`, macOS as `/dev/cu.usbmodem*`, Windows a
 
 ## Appendix A: draft files
 
-These are the exact files that were checked in section 11. They will be added by the
+These are the exact files that were checked in section 11. Like everything else here,
+they are drafts. They will be added by the
 implementation PR. Nothing under `firmware/`, `tools/` or the repo root is changed by
 *this* PR.
+
+### `CLAUDE.md`
+
+```yaml
+project: autonomous_rc_car_platform
+chassis: tamiya_tt02_1:10
+goals: [sensor_fusion, object_detection, semantic_slam, racing_trajectory_optimization]
+phase: actuator_bringup  # laptop -usb-> esp32 -pwm-> servo+esc
+next: ros2_on_rpi5 + micro_ros_on_esp32
+stack:
+  mcu: {chip: esp32-s3-n16r8, build: platformio, platform: espressif32@6.9.0, framework: arduino-esp32-2.0.17, lang: c++gnu11}
+  host: {lang: python>=3.11, deps: tools/requirements.txt, venv: .venv}
+  future: [ros2, micro_ros, raspberry_pi_5]
+hw: {steer: ds3225mg@gpio4, throttle: thw1060_esc@gpio5, battery: 2s_lipo}
+layout:
+  firmware/: esp32 firmware; rules in .claude/rules/firmware.md
+  tools/rccar.py: host cli + Link/SessionLog/tuning api
+  test/esp32_session.py: interactive tuning/sensor scaffold
+  tuning.toml: runtime tuning source of truth, pushed on connect
+  logs/: session jsonl, gitignored
+  docs/: proposals, hardware notes
+cmd: make help
+invariants:
+  - esp32 role: actuator pwm + host comms only; powers nothing
+  - sensors on separate power rail, common ground, <=3.3v signals
+  - pins: left header P1 only; pins.h == README table
+  - protocol change => main.cpp + rccar.py + docs
+  - tuning key change => tuning.toml + rccar.FIRMWARE_KEYS + main.cpp setKey
+```
+
+### `.claude/rules/firmware.md`
+
+````markdown
+---
+paths:
+  - "firmware/**"
+---
+
+# Firmware implementation rules (ESP32-S3-N16R8)
+
+## Build
+- PlatformIO env `esp32s3`: `platform = espressif32@6.9.0` (Arduino-ESP32 2.0.17, ESP-IDF 4.4.7), `board = esp32-s3-devkitc-1`.
+- Memory: `board_build.arduino.memory_type = qio_opi` (quad flash, octal PSRAM). Wrong type = boot loop.
+- Compiler is `-std=gnu++11`: no `std::clamp`, no C++14 aggregate init with default member initializers, no `if constexpr`.
+- `ARDUINO_USB_CDC_ON_BOOT=0`: `Serial` = UART0 = CH343 "COM" port. Do not use the native USB port for comms.
+- Build/flash only via `make build` / `make flash` (both delete `firmware/.pio` first).
+
+## Architecture invariants
+- `controlTask()` (100 Hz default, core 1, high prio) is the ONLY writer of PWM outputs.
+- `loop()` is comms only: parse lines, print replies/telemetry. Never block it, never write PWM from it.
+- Shared state (`g_cfg`, `g_cmd`, `g_out`, `g_armed`, `g_rawSteerUs`) is read/written only inside `portENTER_CRITICAL(&g_mux)`. Copy out, then work on the copy. No Serial calls inside critical sections.
+- PWM uses the ESP-IDF LEDC driver (`driver/ledc.h`), not Arduino `ledc*` (its API differs between core 2.x and 3.x). Servo = LEDC timer 0 / channel 0, ESC = timer 1 / channel 1, 14-bit, low-speed mode.
+- `setup()` must initialise both PWM outputs at 50 Hz / 1500 us BEFORE anything else (the ESC learns neutral at power-on).
+- The control task is registered with the task watchdog; a hang must reset the chip (pins go idle, ESC cuts after 0.1 s).
+
+## Safety invariants (do not weaken without an explicit request)
+- Throttle requires `ARM`; boot state is disarmed.
+- No `D` command for `timeoutMs` -> disarm + neutral + `EVT FAILSAFE`.
+- Steering clamp: calibrated `left`/`right` in drive mode; 500-2500 us absolute (DS3225 datasheet) in RAW mode.
+- ESC clamp: 900-2100 us absolute; `esc_min < esc_neutral < esc_max` enforced on every SET.
+- Frame rates: servo 50-330 Hz (datasheet), ESC 50-400 Hz (above 50 Hz only after confirming the ESC accepts it).
+- `SAVE` refuses unless center lies between left and right.
+
+## Pins
+- Single source of truth: `firmware/include/pins.h`; keep the README table identical.
+- Left header P1 only. Never use GPIO3/46 (strapping), 35-37 (PSRAM), 19/20 (native USB), 43/44 (COM UART), 0/45 (strapping).
+- Reserved (declared, not configured): BATT_LOW 6, IMU_INT 7, ENC_A/B 15/16, I2C SDA/SCL 8/9, DIST_TRIG/ECHO 10/11. Spare: 12, 13, 14, 17, 18.
+- ESP32 supplies no power to peripherals; sensors use a separate rail with common ground and <=3.3 V signals.
+
+## Protocol (ASCII lines, 115200 8N1)
+- Commands: `D h s`, `ARM`, `DISARM`/`STOP`, `PING [seq]`, `TIME ms`, `TEL hz`, `RAW us|OFF`, `CAL LEFT|CENTER|RIGHT us`, `SET key val`, `GET`, `SAVE`, `DEFAULTS`, `SENS name`, `INFO`.
+- Reply prefixes: `OK`, `ERR`, `CFG`, `PONG`, `INFO`, `TEL`, `EVT`, `READY`, `SENS`. Host code matches on these prefixes.
+- `D` is never acknowledged (streamed at `send_hz`).
+- Adding or renaming a command or `SET` key requires matching changes in `tools/rccar.py` (`FIRMWARE_KEYS`), `tuning.toml`, and `docs/`.
+
+## Config persistence
+- `Config` struct is stored as one NVS blob (`Preferences`, namespace `rccar`, key `cfg`).
+- Any change to the `Config` layout MUST bump `CFG_MAGIC` (old blobs are then ignored and defaults load).
+
+## Adding a sensor (future)
+- Add its pins to `pins.h` (already reserved), its tuning keys to `tuning.toml` (commented placeholders exist).
+- Read sensors in their own task or in `controlTask()` if needed for safety (e.g. emergency brake from distance); report via `SENS <name> k=v ...` and telemetry fields.
+- Emergency braking must live in firmware so it works without the host.
+````
+
+### `tuning.toml`
+
+```toml
+# tuning.toml - the one place to tune the car without touching firmware.
+#
+#   make tune       push this file to the ESP32 and save it to its flash
+#   (every other make target also pushes it to ESP32 RAM on connect)
+#   make calibrate  writes steering values back into this file on `save`
+#
+# Keys must stay unique across sections (calibrate edits lines by key name).
+# Hard limits from the datasheets are enforced in firmware; values outside
+# them are clamped or rejected with an error.
+
+[link]                      # laptop <-> ESP32
+send_hz = 20                # command/heartbeat rate. Worst-case command delay = 1000/send_hz ms
+telemetry_hz = 10           # TEL lines from the ESP32, 0..50
+
+[control]
+control_hz = 100            # firmware control loop, 20..500. Keep >= servo_hz to use faster frames
+
+[safety]
+cmd_timeout_ms = 300        # no command for this long -> disarm. Must be > 1000/send_hz (x3 is safe)
+
+[steering]                  # DS3225 servo on GPIO4
+servo_hz = 50               # PWM frame rate, 50..330. 50 Hz = 20 ms frame; 200 Hz = 5 ms (less latency)
+center_us = 1500            # pulse for straight wheels      (make calibrate)
+left_us = 1800              # pulse at full LEFT lock        (make calibrate)
+right_us = 1200             # pulse at full RIGHT lock       (make calibrate)
+max_steer_deg = 25.0        # road-wheel angle at full lock  (measure)
+heading_gain = 1.0          # steering deg per heading deg (+ = left)
+
+[throttle]                  # THW-1060 ESC on GPIO5
+esc_hz = 50                 # 50 is the RC standard. Only raise after confirming the ESC accepts it
+esc_min_us = 1000           # full reverse/brake
+esc_neutral_us = 1500       # must match what the ESC learned at power-on
+esc_max_us = 2000           # full forward
+speed_limit = 0.30          # speed 1.0 -> 30 % throttle (bench safety)
+deadband_us = 0             # skip the ESC dead zone so small speeds move the car
+accel_per_s = 2.0           # max change of speed command per second (slew limit)
+reverse_double_tap = true   # ESC needs brake -> neutral -> reverse (Fwd/Br/Rev mode)
+brake_ms = 150
+gap_ms = 150
+brake_level = 0.5
+
+[logging]
+enabled = true
+dir = "logs"
+log_heartbeats = true       # false = log D commands only when heading/speed change
+
+# ---------------------------------------------------------------------------
+# Future sensors - placeholders, not read by anything yet. Uncomment and wire
+# into firmware when the device is added (see docs/esp32-firmware-proposal.md).
+# ---------------------------------------------------------------------------
+# [battery]
+# low_active_level = 0      # GPIO6 level that means "battery low"
+# debounce_ms = 500
+#
+# [imu]
+# i2c_hz = 400000
+# rate_hz = 200
+# accel_range_g = 4
+# gyro_range_dps = 500
+#
+# [distance]
+# sensor = "lidar_lite_v4"  # or "ultrasonic"
+# rate_hz = 50
+# ebrake_m = 0.5            # firmware emergency stop distance
+# ebrake_min_speed = 0.05   # ignore when nearly stopped
+#
+# [encoder]
+# ticks_per_rev = 0
+# wheel_diameter_m = 0.065
+# gear_ratio = 0.0
+```
 
 ### `firmware/platformio.ini`
 
@@ -594,20 +928,16 @@ static const char *FW_VERSION = "0.1.0";
 // Fixed limits from the datasheets (docs/*.md). Never exceeded, even in RAW.
 // ---------------------------------------------------------------------------
 // DS3225: 500..2500 us, 1500 us neutral, 50..330 Hz frame, 3 us deadband
-constexpr uint32_t SERVO_HZ         = 50;
 constexpr uint16_t SERVO_ABS_MIN_US = 500;
 constexpr uint16_t SERVO_ABS_MAX_US = 2500;
-// THW-1060: standard RC throttle, 1500 us neutral (auto-calibrates at power-on)
-constexpr uint32_t ESC_HZ           = 50;
-constexpr uint16_t ESC_MIN_US       = 1000;
-constexpr uint16_t ESC_NEUTRAL_US   = 1500;
-constexpr uint16_t ESC_MAX_US       = 2000;
+constexpr uint16_t SERVO_MAX_HZ     = 330;
+// THW-1060: standard RC throttle. Hard window; tuned endpoints live in Config.
+constexpr uint16_t ESC_ABS_MIN_US   = 900;
+constexpr uint16_t ESC_ABS_MAX_US   = 2100;
+constexpr uint16_t ESC_MAX_HZ       = 400;   // above 50 Hz: verify ESC first
+constexpr uint16_t BOOT_NEUTRAL_US  = 1500;
 
-constexpr uint32_t PWM_RES_BITS = 14;   // 20000 us / 16384 = 1.22 us per tick
-constexpr uint32_t CONTROL_HZ   = 100;
-constexpr uint32_t BRAKE_MS     = 150;  // double-tap reverse: brake pulse
-constexpr uint32_t GAP_MS       = 150;  // double-tap reverse: neutral gap
-constexpr float    BRAKE_LEVEL  = 0.5f; // brake pulse strength (fraction)
+constexpr uint32_t PWM_RES_BITS = 14;   // at 50 Hz: 20000 us / 16384 = 1.22 us per tick
 
 constexpr ledc_mode_t      LEDC_MODE      = LEDC_LOW_SPEED_MODE;
 constexpr ledc_timer_t     STEER_TIMER    = LEDC_TIMER_0;
@@ -618,7 +948,7 @@ constexpr ledc_channel_t   THROTTLE_CH    = LEDC_CHANNEL_1;
 // ---------------------------------------------------------------------------
 // Tunable config, persisted in NVS flash
 // ---------------------------------------------------------------------------
-constexpr uint32_t CFG_MAGIC = 0xC0FFEE01;  // bump when Config layout changes
+constexpr uint32_t CFG_MAGIC = 0xC0FFEE02;  // bump when Config layout changes
 
 struct Config {
   uint32_t magic        = CFG_MAGIC;
@@ -632,6 +962,15 @@ struct Config {
   float    accelPerSec   = 2.0f;   // max change of speed command per second
   uint16_t timeoutMs     = 300;    // no command for this long -> failsafe
   uint8_t  doubleTapRev  = 1;      // ESC needs brake-neutral-reverse sequence
+  uint16_t brakeMs       = 150;    // double-tap reverse: brake pulse length
+  uint16_t gapMs         = 150;    // double-tap reverse: neutral gap length
+  float    brakeLevel    = 0.5f;   // double-tap reverse: brake strength
+  uint16_t escMinUs      = 1000;   // full reverse
+  uint16_t escNeutralUs  = 1500;
+  uint16_t escMaxUs      = 2000;   // full forward
+  uint16_t servoHz       = 50;     // DS3225 accepts 50..330
+  uint16_t escHz         = 50;     // RC standard; raise only if the ESC accepts it
+  uint16_t controlHz     = 100;    // control loop rate
 };
 
 struct Command {
@@ -642,7 +981,7 @@ struct Command {
 
 struct Output {
   uint16_t steerUs    = 1500;
-  uint16_t throttleUs = ESC_NEUTRAL_US;
+  uint16_t throttleUs = BOOT_NEUTRAL_US;
   float    steerDeg   = 0.0f;
 };
 
@@ -717,10 +1056,10 @@ static uint16_t steerDegToUs(float deg, const Config &c) {
 
 // throttle fraction (-1..1, already speed-limited) -> ESC pulse
 static uint16_t throttleToUs(float u, const Config &c) {
-  if (fabsf(u) < 0.001f) return ESC_NEUTRAL_US;
-  float span = (u > 0 ? ESC_MAX_US - ESC_NEUTRAL_US : ESC_NEUTRAL_US - ESC_MIN_US) - c.deadbandUs;
-  float us = ESC_NEUTRAL_US + (u > 0 ? 1 : -1) * (c.deadbandUs + fabsf(u) * span);
-  return clampv<uint16_t>((uint16_t)lroundf(us), ESC_MIN_US, ESC_MAX_US);
+  if (fabsf(u) < 0.001f) return c.escNeutralUs;
+  float span = (u > 0 ? c.escMaxUs - c.escNeutralUs : c.escNeutralUs - c.escMinUs) - c.deadbandUs;
+  float us = c.escNeutralUs + (u > 0 ? 1 : -1) * (c.deadbandUs + fabsf(u) * span);
+  return clampv<uint16_t>((uint16_t)lroundf(us), c.escMinUs, c.escMaxUs);
 }
 
 // ---------------------------------------------------------------------------
@@ -734,15 +1073,22 @@ static void controlTask(void *) {
   float speedOut = 0.0f;
   RevState rs = RevState::Forward;
   uint64_t rsSince = 0;
+  uint16_t servoHz = 50, escHz = 50;  // what the LEDC timers currently run at
+  uint16_t controlHz = 100;
 
   for (;;) {
-    vTaskDelayUntil(&last, pdMS_TO_TICKS(1000 / CONTROL_HZ));
+    vTaskDelayUntil(&last, pdMS_TO_TICKS(1000 / controlHz));
     esp_task_wdt_reset();
 
     Config cfg; Command cmd; bool armed; int raw;
     portENTER_CRITICAL(&g_mux);
     cfg = g_cfg; cmd = g_cmd; armed = g_armed; raw = g_rawSteerUs;
     portEXIT_CRITICAL(&g_mux);
+
+    // Runtime frame-rate changes (tuning.toml -> SET servo_hz / esc_hz)
+    if (cfg.servoHz != servoHz) { ledc_set_freq(LEDC_MODE, STEER_TIMER, cfg.servoHz); servoHz = cfg.servoHz; }
+    if (cfg.escHz != escHz)     { ledc_set_freq(LEDC_MODE, THROTTLE_TIMER, cfg.escHz); escHz = cfg.escHz; }
+    controlHz = cfg.controlHz;
 
     const uint64_t now = nowMs();
     const bool stale = (now - cmd.stampMs) > cfg.timeoutMs;
@@ -755,7 +1101,7 @@ static void controlTask(void *) {
 
     // Speed: slew-limited toward target; disarm snaps to neutral.
     const float target = armed ? clampv(cmd.speed, -1.0f, 1.0f) : 0.0f;
-    const float step = cfg.accelPerSec / CONTROL_HZ;
+    const float step = cfg.accelPerSec / controlHz;
     speedOut = armed ? speedOut + clampv(target - speedOut, -step, step) : 0.0f;
     float u = speedOut * cfg.speedLimit;
 
@@ -764,16 +1110,16 @@ static void controlTask(void *) {
     if (cfg.doubleTapRev) {
       switch (rs) {
         case RevState::Forward:
-          if (u < 0) { rs = RevState::Brake; rsSince = now; u = -BRAKE_LEVEL; }
+          if (u < 0) { rs = RevState::Brake; rsSince = now; u = -cfg.brakeLevel; }
           break;
         case RevState::Brake:
           if (u >= 0) rs = RevState::Forward;
-          else if (now - rsSince >= BRAKE_MS) { rs = RevState::Gap; rsSince = now; u = 0; }
-          else u = -BRAKE_LEVEL;
+          else if (now - rsSince >= cfg.brakeMs) { rs = RevState::Gap; rsSince = now; u = 0; }
+          else u = -cfg.brakeLevel;
           break;
         case RevState::Gap:
           if (u >= 0) rs = RevState::Forward;
-          else if (now - rsSince >= GAP_MS) rs = RevState::Reverse;
+          else if (now - rsSince >= cfg.gapMs) rs = RevState::Reverse;
           else u = 0;
           break;
         case RevState::Reverse:
@@ -789,8 +1135,8 @@ static void controlTask(void *) {
         : steerDegToUs(steerDeg, cfg);
     const uint16_t thrUs = throttleToUs(u, cfg);
 
-    pwmWriteUs(STEER_CH, SERVO_HZ, steerUs);
-    pwmWriteUs(THROTTLE_CH, ESC_HZ, thrUs);
+    pwmWriteUs(STEER_CH, servoHz, steerUs);
+    pwmWriteUs(THROTTLE_CH, escHz, thrUs);
 
     portENTER_CRITICAL(&g_mux);
     g_out.steerUs = steerUs; g_out.throttleUs = thrUs; g_out.steerDeg = steerDeg;
@@ -825,10 +1171,13 @@ static void printConfig() {
   Config c;
   portENTER_CRITICAL(&g_mux); c = g_cfg; portEXIT_CRITICAL(&g_mux);
   Serial.printf("CFG center=%u left=%u right=%u maxdeg=%.1f gain=%.2f limit=%.2f "
-                "deadband=%u accel=%.2f timeout=%u revmode=%u\n",
+                "deadband=%u accel=%.2f timeout=%u revmode=%u brake_ms=%u gap_ms=%u "
+                "brake_level=%.2f esc_min=%u esc_neutral=%u esc_max=%u servo_hz=%u "
+                "esc_hz=%u control_hz=%u\n",
                 c.steerCenterUs, c.steerLeftUs, c.steerRightUs, c.maxSteerDeg,
                 c.headingGain, c.speedLimit, c.deadbandUs, c.accelPerSec,
-                c.timeoutMs, c.doubleTapRev);
+                c.timeoutMs, c.doubleTapRev, c.brakeMs, c.gapMs, c.brakeLevel,
+                c.escMinUs, c.escNeutralUs, c.escMaxUs, c.servoHz, c.escHz, c.controlHz);
 }
 
 static void printTelemetry() {
@@ -849,6 +1198,15 @@ static bool setKey(Config &c, const char *key, float v) {
   else if (!strcasecmp(key, "accel"))    c.accelPerSec = clampv(v, 0.1f, 100.0f);
   else if (!strcasecmp(key, "timeout"))  c.timeoutMs   = (uint16_t)clampv(v, 50.0f, 2000.0f);
   else if (!strcasecmp(key, "revmode"))  c.doubleTapRev = v != 0;
+  else if (!strcasecmp(key, "brake_ms")) c.brakeMs     = (uint16_t)clampv(v, 0.0f, 1000.0f);
+  else if (!strcasecmp(key, "gap_ms"))   c.gapMs       = (uint16_t)clampv(v, 0.0f, 1000.0f);
+  else if (!strcasecmp(key, "brake_level")) c.brakeLevel = clampv(v, 0.0f, 1.0f);
+  else if (!strcasecmp(key, "esc_min"))     c.escMinUs     = (uint16_t)clampv(v, (float)ESC_ABS_MIN_US, 1500.0f);
+  else if (!strcasecmp(key, "esc_neutral")) c.escNeutralUs = (uint16_t)clampv(v, 1300.0f, 1700.0f);
+  else if (!strcasecmp(key, "esc_max"))     c.escMaxUs     = (uint16_t)clampv(v, 1500.0f, (float)ESC_ABS_MAX_US);
+  else if (!strcasecmp(key, "servo_hz"))    c.servoHz   = (uint16_t)clampv(v, 50.0f, (float)SERVO_MAX_HZ);
+  else if (!strcasecmp(key, "esc_hz"))      c.escHz     = (uint16_t)clampv(v, 50.0f, (float)ESC_MAX_HZ);
+  else if (!strcasecmp(key, "control_hz"))  c.controlHz = (uint16_t)clampv(v, 20.0f, 500.0f);
   else return false;
   return true;
 }
@@ -902,10 +1260,14 @@ static void handleLine(char *line) {
     if (ok) printConfig(); else Serial.println("ERR CAL LEFT|CENTER|RIGHT <us>");
   } else if (!strcasecmp(tok, "SET")) {  // SET <key> <value>
     if (!a1 || !a2) { Serial.println("ERR usage: SET <key> <value>"); return; }
-    portENTER_CRITICAL(&g_mux);
-    bool ok = setKey(g_cfg, a1, strtof(a2, nullptr));
-    portEXIT_CRITICAL(&g_mux);
-    if (ok) printConfig(); else Serial.printf("ERR unknown key %s\n", a1);
+    Config c;
+    portENTER_CRITICAL(&g_mux); c = g_cfg; portEXIT_CRITICAL(&g_mux);
+    if (!setKey(c, a1, strtof(a2, nullptr))) { Serial.printf("ERR unknown key %s\n", a1); return; }
+    if (!(c.escMinUs < c.escNeutralUs && c.escNeutralUs < c.escMaxUs)) {
+      Serial.println("ERR need esc_min < esc_neutral < esc_max"); return;
+    }
+    portENTER_CRITICAL(&g_mux); g_cfg = c; portEXIT_CRITICAL(&g_mux);
+    printConfig();
   } else if (!strcasecmp(tok, "GET")) {
     printConfig();
   } else if (!strcasecmp(tok, "SAVE")) {
@@ -921,6 +1283,8 @@ static void handleLine(char *line) {
   } else if (!strcasecmp(tok, "TEL")) {  // TEL <hz>, 0 = off
     g_telemetryHz = a1 ? clampv<int>(atoi(a1), 0, 50) : 10;
     Serial.printf("OK TEL %u\n", g_telemetryHz);
+  } else if (!strcasecmp(tok, "SENS")) {  // reserved: future sensor reads
+    Serial.printf("ERR SENS %s not implemented\n", a1 ? a1 : "?");
   } else if (!strcasecmp(tok, "INFO")) {
     Serial.printf("INFO fw=%s chip=%s rev=%d psram=%u flash=%u steer_pin=%d throttle_pin=%d\n",
                   FW_VERSION, ESP.getChipModel(), ESP.getChipRevision(),
@@ -935,8 +1299,10 @@ static void handleLine(char *line) {
 void setup() {
   // Outputs first: neutral pulses from the very first moment, so the ESC
   // learns 1500 us as neutral when it is switched on.
-  pwmInit(PIN_STEER_PWM, STEER_TIMER, STEER_CH, SERVO_HZ, 1500);
-  pwmInit(PIN_THROTTLE_PWM, THROTTLE_TIMER, THROTTLE_CH, ESC_HZ, ESC_NEUTRAL_US);
+  // Always boot at 50 Hz / 1500 us; saved frame rates are applied by the
+  // control task once it starts.
+  pwmInit(PIN_STEER_PWM, STEER_TIMER, STEER_CH, 50, BOOT_NEUTRAL_US);
+  pwmInit(PIN_THROTTLE_PWM, THROTTLE_TIMER, THROTTLE_CH, 50, BOOT_NEUTRAL_US);
 
   Serial.begin(115200);
   loadConfig();
@@ -976,48 +1342,180 @@ void loop() {
 """Laptop-side CLI for the ESP32-S3 RC car actuator bridge.
 
 Talks the line protocol in firmware/src/main.cpp over the board's "COM"
-USB-C port (CH343 USB-UART bridge). Every subcommand is wrapped by a
-Makefile target; run `python tools/rccar.py -h` for the full list.
+USB-C port (CH343 USB-UART bridge). Tuning comes from tuning.toml at the
+repo root; every session is logged to logs/*.jsonl. Every subcommand is
+wrapped by a Makefile target; run `python tools/rccar.py -h` for the list.
 """
 from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
+import re
 import shutil
 import subprocess
 import sys
 import time
+import tomllib
+from datetime import datetime
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parents[1]
+TUNING_FILE = ROOT / "tuning.toml"
 BAUD = 115200
-SEND_HZ = 20                      # drive command rate; firmware timeout is 300 ms
 CH343_VID, CH343_PID = 0x1A86, 0x55D3
 ESPRESSIF_VID = 0x303A            # native USB port (GPIO19/20), not used for comms
+
+# tuning.toml (section, key) -> firmware command prefix. Order matters for ESC
+# endpoints: the firmware rejects any SET that breaks esc_min < neutral < max.
+FIRMWARE_KEYS = [
+    (("steering", "center_us"), "CAL CENTER"),
+    (("steering", "left_us"), "CAL LEFT"),
+    (("steering", "right_us"), "CAL RIGHT"),
+    (("steering", "max_steer_deg"), "SET maxdeg"),
+    (("steering", "heading_gain"), "SET gain"),
+    (("steering", "servo_hz"), "SET servo_hz"),
+    (("throttle", "esc_min_us"), "SET esc_min"),
+    (("throttle", "esc_max_us"), "SET esc_max"),
+    (("throttle", "esc_neutral_us"), "SET esc_neutral"),
+    (("throttle", "esc_hz"), "SET esc_hz"),
+    (("throttle", "speed_limit"), "SET limit"),
+    (("throttle", "deadband_us"), "SET deadband"),
+    (("throttle", "accel_per_s"), "SET accel"),
+    (("throttle", "reverse_double_tap"), "SET revmode"),
+    (("throttle", "brake_ms"), "SET brake_ms"),
+    (("throttle", "gap_ms"), "SET gap_ms"),
+    (("throttle", "brake_level"), "SET brake_level"),
+    (("safety", "cmd_timeout_ms"), "SET timeout"),
+    (("control", "control_hz"), "SET control_hz"),
+]
+
+
+def load_tuning(path: Path = TUNING_FILE) -> dict:
+    with open(path, "rb") as f:
+        return tomllib.load(f)
+
+
+def update_tuning_file(values: dict[str, float | int], path: Path = TUNING_FILE) -> None:
+    """Rewrite `key = value` lines in place, keeping comments and layout.
+
+    Keys in tuning.toml are unique across sections, so a per-key regex is safe.
+    """
+    text = path.read_text()
+    for key, val in values.items():
+        text, n = re.subn(rf"(?m)^(\s*{key}\s*=\s*)[^#\n]*?(\s*(#.*)?)$",
+                          rf"\g<1>{val}\g<2>", text, count=1)
+        if n != 1:
+            raise KeyError(f"{key} not found in {path.name}")
+    path.write_text(text)
+
+
+def parse_kv(line: str) -> dict[str, float | str]:
+    """'TEL t=1 hdg=2.0 ...' -> {'t': 1.0, 'hdg': 2.0, ...}"""
+    out: dict[str, float | str] = {}
+    for tok in line.split()[1:]:
+        if "=" in tok:
+            k, v = tok.split("=", 1)
+            try:
+                out[k] = float(v)
+            except ValueError:
+                out[k] = v
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Session log: one JSON object per line, load with pandas.read_json(lines=True)
+# ---------------------------------------------------------------------------
+class SessionLog:
+    def __init__(self, label: str, tuning: dict, port: str):
+        cfg = tuning.get("logging", {})
+        self.heartbeats = cfg.get("log_heartbeats", True)
+        self._last_drive: str | None = None
+        self.file = None
+        if not cfg.get("enabled", True):
+            return
+        log_dir = ROOT / cfg.get("dir", "logs")
+        log_dir.mkdir(exist_ok=True)
+        self.path = log_dir / f"{datetime.now():%Y%m%d-%H%M%S}_{label}.jsonl"
+        self.file = open(self.path, "w", buffering=1)  # line-buffered: survives crashes
+        git = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"],
+                             capture_output=True, text=True).stdout.strip()
+        self.write("session", "", {"label": label, "port": port, "argv": sys.argv,
+                                   "git": git, "tuning": tuning})
+
+    def write(self, kind: str, line: str, data: dict | None = None, direction: str = "") -> None:
+        if not self.file:
+            return
+        rec = {"t": time.time(), "mono": time.monotonic(), "dir": direction,
+               "kind": kind, "line": line}
+        if data:
+            rec["data"] = data
+        self.file.write(json.dumps(rec) + "\n")
+
+    def tx(self, line: str) -> None:
+        kind = line.split()[0].upper() if line.strip() else ""
+        if kind == "D":
+            if not self.heartbeats and line == self._last_drive:
+                return                       # unchanged heartbeat
+            self._last_drive = line
+        self.write(kind, line, direction="tx")
+
+    def rx(self, line: str) -> None:
+        kind = line.split()[0] if line else ""
+        data = parse_kv(line) if kind in ("TEL", "CFG", "INFO", "SENS") else None
+        self.write(kind, line, data, direction="rx")
+
+    def note(self, text: str) -> None:
+        self.write("NOTE", text)
+
+    def close(self) -> None:
+        if self.file:
+            self.file.close()
+            print(f"log: {self.path.relative_to(ROOT)}")
 
 
 # ---------------------------------------------------------------------------
 # Serial link
 # ---------------------------------------------------------------------------
 class Link:
-    def __init__(self, port: str, baud: int = BAUD):
+    def __init__(self, port: str, label: str = "session", apply: bool = True):
         import serial
 
+        self.tuning = load_tuning()
+        self.send_hz = self.tuning["link"]["send_hz"]
+        self.log = SessionLog(label, self.tuning, port)
         self.ser = serial.Serial()
-        self.ser.port, self.ser.baudrate, self.ser.timeout = port, baud, 0.05
+        self.ser.port, self.ser.baudrate, self.ser.timeout = port, BAUD, 0.05
         self.ser.dtr = False      # keep EN/IO0 released so opening doesn't reset
         self.ser.rts = False
         self.ser.open()
         self.handshake()
+        if apply:
+            self.apply_tuning()
 
     def send(self, line: str) -> None:
+        self.log.tx(line)
         self.ser.write((line + "\n").encode())
 
     def readline(self) -> str | None:
         raw = self.ser.readline()
-        return raw.decode(errors="replace").strip() if raw else None
+        if not raw:
+            return None
+        line = raw.decode(errors="replace").strip()
+        self.log.rx(line)
+        return line
 
-    def expect(self, prefix: str, timeout: float = 1.0) -> str:
-        """Read lines until one starts with prefix; print unexpected ones."""
+    def drain(self) -> list[str]:
+        """Read (and log) every complete line already received, without waiting."""
+        lines = []
+        while self.ser.in_waiting:
+            line = self.readline()
+            if line is not None:
+                lines.append(line)
+        return lines
+
+    def expect(self, prefix: str | tuple[str, ...], timeout: float = 1.0) -> str:
+        """Read lines until one starts with prefix; print unexpected errors."""
         end = time.monotonic() + timeout
         while time.monotonic() < end:
             line = self.readline()
@@ -1029,7 +1527,7 @@ class Link:
                 print(f"  esp32: {line}")
         raise TimeoutError(f"no '{prefix}' reply within {timeout}s")
 
-    def request(self, line: str, prefix: str, timeout: float = 1.0) -> str:
+    def request(self, line: str, prefix: str | tuple[str, ...], timeout: float = 1.0) -> str:
         self.send(line)
         return self.expect(prefix, timeout)
 
@@ -1044,6 +1542,17 @@ class Link:
                 pass
         raise SystemExit("ESP32 not answering PING - is the firmware flashed? (make flash)")
 
+    def apply_tuning(self) -> str:
+        """Push tuning.toml into firmware RAM. Returns the resulting CFG line."""
+        for (section, key), cmd in FIRMWARE_KEYS:
+            val = self.tuning[section][key]
+            val = int(val) if isinstance(val, bool) else val
+            reply = self.request(f"{cmd} {val}", ("CFG", "ERR"))
+            if reply.startswith("ERR"):
+                raise SystemExit(f"tuning.toml [{section}] {key} = {val}: {reply}")
+        self.request(f"TEL {self.tuning['link']['telemetry_hz']}", "OK TEL")
+        return self.request("GET", "CFG")
+
     def ping(self, seq: int) -> tuple[float, int]:
         t0 = time.monotonic()
         reply = self.request(f"PING {seq}", f"PONG {seq}")
@@ -1054,7 +1563,8 @@ class Link:
         end = time.monotonic() + seconds
         while time.monotonic() < end:
             self.send(f"D {heading:.1f} {speed:.3f}")
-            time.sleep(1.0 / SEND_HZ)
+            self.drain()                       # log telemetry, keep buffer empty
+            time.sleep(1.0 / self.send_hz)
 
     def close(self) -> None:
         try:
@@ -1063,6 +1573,7 @@ class Link:
             self.send("TEL 0")
         finally:
             self.ser.close()
+            self.log.close()
 
 
 def find_port() -> str | None:
@@ -1078,20 +1589,19 @@ def find_port() -> str | None:
     return None
 
 
-def open_link(args) -> Link:
+def open_link(args, label: str, apply: bool = True) -> Link:
     port = args.port or find_port()
     if not port:
         raise SystemExit("no ESP32 COM port found - run `make detect`")
-    return Link(port)
+    return Link(port, label, apply)
 
 
 # ---------------------------------------------------------------------------
 # Subcommands
 # ---------------------------------------------------------------------------
 def cmd_check_env(args) -> int:
-    ok = True
-    print(f"python   {sys.version.split()[0]}", "OK" if sys.version_info >= (3, 9) else "NEED >= 3.9")
-    ok &= sys.version_info >= (3, 9)
+    ok = sys.version_info >= (3, 11)       # tomllib
+    print(f"python   {sys.version.split()[0]}", "OK" if ok else "NEED >= 3.11")
     for mod, pkg in (("serial", "pyserial"), ("esptool", "esptool")):
         found = importlib.util.find_spec(mod) is not None
         print(f"{pkg:<8} {'OK' if found else 'MISSING (make setup)'}")
@@ -1100,6 +1610,12 @@ def cmd_check_env(args) -> int:
     pio = str(venv_pio) if venv_pio.exists() else shutil.which("pio")
     print(f"pio      {pio or 'MISSING (make setup)'}")
     ok &= pio is not None
+    try:
+        load_tuning()
+        print("tuning.toml OK")
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        print(f"tuning.toml BROKEN: {e}")
+        ok = False
     if sys.platform.startswith("linux"):
         groups = subprocess.run(["id", "-Gn"], capture_output=True, text=True).stdout.split()
         member = bool({"dialout", "uucp"} & set(groups))
@@ -1136,7 +1652,7 @@ def cmd_detect(args) -> int:
         return rc
     time.sleep(1.5)                        # let the firmware boot after the reset
     try:
-        link = Link(port)
+        link = Link(port, "detect", apply=False)
         print("\nfirmware:", link.request("INFO", "INFO"))
         link.close()
     except SystemExit as e:
@@ -1145,7 +1661,7 @@ def cmd_detect(args) -> int:
 
 
 def cmd_ping(args) -> int:
-    link = open_link(args)
+    link = open_link(args, "ping", apply=False)
     rtts = [link.ping(i)[0] for i in range(1, 11)]
     print(f"10 pings: min {min(rtts):.1f} ms  avg {sum(rtts) / len(rtts):.1f} ms  max {max(rtts):.1f} ms")
     link.close()
@@ -1154,31 +1670,41 @@ def cmd_ping(args) -> int:
 
 def cmd_sync_time(args) -> int:
     """Cristian's algorithm: best of N round trips, assume symmetric latency."""
-    link = open_link(args)
+    link = open_link(args, "sync-time", apply=False)
     best = min(link.ping(i)[0] for i in range(1, 11))
     unix_ms = int(time.time() * 1000 + best / 2)
     link.request(f"TIME {unix_ms}", "OK TIME")
     link.request("TEL 10", "OK TEL")
-    tel = link.expect("TEL ", 1.0)
-    esp_unix = int(dict(kv.split("=") for kv in tel.split()[1:])["unix"])
+    esp_unix = parse_kv(link.expect("TEL ", 1.0))["unix"]
     print(f"synced: rtt {best:.1f} ms, esp32 - laptop = {esp_unix - time.time() * 1000:+.0f} ms")
     link.close()
     return 0
 
 
+def cmd_tune(args) -> int:
+    """Push tuning.toml to the ESP32 and persist it, so it boots tuned."""
+    link = open_link(args, "tune")
+    print(link.request("GET", "CFG"))
+    print(link.request("SAVE", ("OK SAVE", "ERR"), 2.0))
+    link.close()
+    return 0
+
+
 def cmd_test(args) -> int:
-    link = open_link(args)
+    link = open_link(args, "test-throttle" if args.throttle else "test")
     print(link.request("INFO", "INFO"))
     cfg = link.request("GET", "CFG")
     print(cfg)
-    maxdeg = float(cfg.split("maxdeg=")[1].split()[0])
+    maxdeg = parse_kv(cfg)["maxdeg"]
 
     print("\n[1/3] steering sweep (throttle disarmed)")
+    link.log.note("steering sweep")
     for hdg in (0, maxdeg, 0, -maxdeg, 0):
         print(f"  heading {hdg:+.0f} deg")
         link.drive_for(hdg, 0.0, 1.0)
 
     print("\n[2/3] failsafe: stop sending while armed")
+    link.log.note("failsafe test")
     link.request("ARM", "OK ARM")
     link.drive_for(0, 0.0, 0.3)
     t0 = time.monotonic()
@@ -1192,6 +1718,7 @@ def cmd_test(args) -> int:
     if input("\n[3/3] throttle test. Wheels off the ground? type 'yes': ").strip() != "yes":
         link.close()
         return 1
+    link.log.note("throttle test")
     link.request("ARM", "OK ARM")
     for label, spd, sec in (("forward", 0.5, 1.5), ("neutral", 0.0, 1.0),
                             ("reverse", -0.5, 1.5), ("neutral", 0.0, 0.5)):
@@ -1208,14 +1735,19 @@ CAL_HELP = """commands:
   center|left|right   store current pulse as that end point
   maxdeg D       road-wheel angle (deg) at full lock, measured
   gain G         heading -> steering gain
-  show           print config      save   persist to flash
-  q              quit (unsaved changes are kept until reboot)"""
+  show           print config
+  save           write values to tuning.toml AND the ESP32 flash
+  q              quit (unsaved values are discarded on next connect)"""
+
+CAL_TO_TOML = {"center": "center_us", "left": "left_us", "right": "right_us",
+               "maxdeg": "max_steer_deg", "gain": "heading_gain"}
 
 
 def cmd_calibrate(args) -> int:
-    link = open_link(args)
+    link = open_link(args, "calibrate")
     link.send("STOP")
     us = 1500
+    changed: dict[str, float | int] = {}
     link.request(f"RAW {us}", "OK RAW")
     print(CAL_HELP)
     print("Start: servo at 1500 us. Find where the wheels point straight, then each lock.")
@@ -1231,21 +1763,26 @@ def cmd_calibrate(args) -> int:
                 us = int(cmd[1:])
             elif cmd in ("center", "left", "right"):
                 print(link.request(f"CAL {cmd.upper()} {us}", "CFG"))
+                changed[CAL_TO_TOML[cmd]] = us
                 continue
             elif cmd.split()[0] in ("maxdeg", "gain"):
-                print(link.request(f"SET {cmd}", "CFG"))
+                name, val = cmd.split()
+                print(link.request(f"SET {name} {float(val)}", "CFG"))
+                changed[CAL_TO_TOML[name]] = float(val)
                 continue
             elif cmd == "show":
                 print(link.request("GET", "CFG"))
                 continue
             elif cmd == "save":
-                link.send("SAVE")
-                print(link.expect("OK SAVE", 2.0))
+                print(link.request("SAVE", ("OK SAVE", "ERR"), 2.0))
+                if changed:
+                    update_tuning_file(changed)
+                    print(f"  tuning.toml updated: {changed}")
                 continue
             else:
                 print(CAL_HELP)
                 continue
-        except (ValueError, IndexError, TimeoutError) as e:
+        except (ValueError, IndexError, KeyError, TimeoutError) as e:
             print(f"  ? {e}")
             continue
         us = max(500, min(2500, us))
@@ -1257,8 +1794,7 @@ def cmd_calibrate(args) -> int:
 def cmd_teleop(args) -> int:
     import curses
 
-    link = open_link(args)
-    link.request("TEL 10", "OK TEL")
+    link = open_link(args, "teleop")
 
     def ui(scr) -> None:
         scr.nodelay(True)
@@ -1283,7 +1819,7 @@ def cmd_teleop(args) -> int:
                 link.send("DISARM" if armed else "ARM")
                 armed = not armed
             link.send(f"D {heading:.1f} {speed:.2f}")
-            while (line := link.readline()) is not None:
+            for line in link.drain():
                 if line.startswith("TEL"):
                     tel = line
                 elif line.startswith("EVT FAILSAFE"):
@@ -1293,7 +1829,7 @@ def cmd_teleop(args) -> int:
             scr.addstr(2, 0, f"heading {heading:+6.1f} deg   speed {speed:+.2f}   {'ARMED' if armed else 'disarmed'}")
             scr.addstr(4, 0, tel[:curses.COLS - 1])
             scr.refresh()
-            time.sleep(1.0 / SEND_HZ)
+            time.sleep(1.0 / link.send_hz)
 
     try:
         curses.wrapper(ui)
@@ -1304,7 +1840,7 @@ def cmd_teleop(args) -> int:
 
 def cmd_drive(args) -> int:
     """One-shot scripted command, e.g. for tuning runs or other scripts."""
-    link = open_link(args)
+    link = open_link(args, "drive")
     if args.speed:
         link.request("ARM", "OK ARM")
     link.drive_for(args.heading, args.speed, args.seconds)
@@ -1321,6 +1857,7 @@ def main() -> int:
     sub.add_parser("detect").set_defaults(fn=cmd_detect)
     sub.add_parser("ping").set_defaults(fn=cmd_ping)
     sub.add_parser("sync-time").set_defaults(fn=cmd_sync_time)
+    sub.add_parser("tune").set_defaults(fn=cmd_tune)
     t = sub.add_parser("test")
     t.add_argument("--throttle", action="store_true", help="also spin the motor")
     t.set_defaults(fn=cmd_test)
@@ -1347,6 +1884,183 @@ pyserial>=3.5
 esptool>=4.8,<5
 ```
 
+### `test/esp32_session.py`
+
+```python
+#!/usr/bin/env python3
+"""Interactive scratch session with the ESP32 for tuning and quick tests.
+
+    make session            # or: .venv/bin/python test/esp32_session.py [--port X]
+
+At the prompt:
+    PING / GET / SET limit 0.4 / RAW 1600 ...   raw firmware commands (replies printed)
+    :drive(10, 0.2, 2)                          call a helper below (Python, prefix ':')
+    :set_param("servo_hz", 100)
+    :read_imu()
+    q                                           quit (disarms, logs to logs/)
+
+Typed raw commands do not stream heartbeats, so `ARM` alone times out after
+cmd_timeout_ms by design. Use :drive() to move the car.
+
+Add your own helpers here; the transport, tuning and logging live in
+tools/rccar.py so this file stays a thin, hackable layer.
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+from rccar import Link, find_port, parse_kv  # noqa: E402
+
+link: Link | None = None
+
+
+# --- basics -----------------------------------------------------------------
+def connect(port: str | None = None) -> Link:
+    """Open the COM port, handshake, push tuning.toml, start a log file."""
+    global link
+    port = port or find_port()
+    if not port:
+        raise SystemExit("no ESP32 COM port found - run `make detect`")
+    link = Link(port, label="session")
+    return link
+
+
+def send(cmd: str) -> None:
+    link.send(cmd)
+
+
+def ask(cmd: str, prefix: str | tuple[str, ...] = ("OK", "ERR", "CFG", "PONG", "INFO", "SENS"),
+        timeout: float = 1.0) -> str:
+    """Send one command and return the first matching reply line."""
+    return link.request(cmd, prefix, timeout)
+
+
+def responses(seconds: float = 0.3) -> list[str]:
+    """Collect everything the ESP32 says for a short window."""
+    end, lines = time.monotonic() + seconds, []
+    while time.monotonic() < end:
+        lines += link.drain()
+        time.sleep(0.01)
+    return lines
+
+
+def note(text: str) -> None:
+    """Drop a marker into the session log (e.g. 'changed tyres')."""
+    link.log.note(text)
+
+
+# --- actuators ----------------------------------------------------------------
+def set_param(key: str, value: float) -> dict:
+    """Live-tune one firmware value (RAM only; edit tuning.toml to keep it)."""
+    return parse_kv(ask(f"SET {key} {value}", ("CFG", "ERR")))
+
+
+def config() -> dict:
+    return parse_kv(ask("GET", "CFG"))
+
+
+def steer_raw(us: int | None) -> str:
+    """Hold the servo at an exact pulse; None returns to normal steering."""
+    return ask(f"RAW {us if us else 'OFF'}", "OK RAW")
+
+
+def drive(heading: float, speed: float, seconds: float = 1.0) -> None:
+    """Arm (if moving), stream commands for `seconds`, then stop."""
+    if speed:
+        ask("ARM", "OK ARM")
+    note(f"drive heading={heading} speed={speed} seconds={seconds}")
+    link.drive_for(heading, speed, seconds)
+    link.drive_for(heading, 0.0, 0.2)
+    ask("DISARM", "OK DISARM")
+
+
+def telemetry(n: int = 10, timeout: float = 3.0) -> list[dict]:
+    """Return the next n TEL records as dicts."""
+    out, end = [], time.monotonic() + timeout
+    while len(out) < n and time.monotonic() < end:
+        out += [parse_kv(l) for l in link.drain() if l.startswith("TEL")]
+        time.sleep(0.01)
+    return out[:n]
+
+
+def latency(n: int = 20) -> dict:
+    """USB round-trip stats in ms."""
+    rtts = sorted(link.ping(i)[0] for i in range(1, n + 1))
+    return {"min": rtts[0], "median": rtts[n // 2], "max": rtts[-1]}
+
+
+# --- sensors (stubs until firmware implements SENS <name>) ---------------------
+def read_sensor(name: str) -> dict | None:
+    reply = ask(f"SENS {name}", ("SENS", "ERR"))
+    if reply.startswith("ERR"):
+        print(f"  {reply}")
+        return None
+    return parse_kv(reply)
+
+
+def read_battery() -> dict | None:
+    return read_sensor("BATT")
+
+
+def read_imu() -> dict | None:
+    return read_sensor("IMU")
+
+
+def read_distance() -> dict | None:
+    return read_sensor("DIST")
+
+
+def read_encoder() -> dict | None:
+    return read_sensor("ENC")
+
+
+# --- loop -----------------------------------------------------------------------
+HELPERS = {name: obj for name, obj in globals().items()
+           if callable(obj) and not name.startswith("_") and name not in ("Link", "main")}
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--port")
+    args = ap.parse_args()
+    connect(args.port)
+    print(ask("INFO", "INFO"))
+    print("raw command, :python_helper(...), or q to quit")
+    try:
+        while True:
+            try:
+                line = input("esp32> ").strip()
+            except EOFError:
+                break
+            if line in ("q", "quit", "exit"):
+                break
+            if not line:
+                continue
+            if line.startswith(":"):
+                try:
+                    result = eval(line[1:], HELPERS)
+                    if result is not None:
+                        print(result)
+                except Exception as e:  # keep the session alive on typos
+                    print(f"  {type(e).__name__}: {e}")
+                continue
+            send(line)
+            for reply in responses():
+                if not reply.startswith("TEL"):
+                    print(reply)
+    finally:
+        link.close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
 ### `Makefile`
 
 ```make
@@ -1365,8 +2079,8 @@ endif
 PORT_ARG := $(if $(PORT),--port $(PORT),)
 
 .DEFAULT_GOAL := help
-.PHONY: help setup check detect sync-time clean build flash monitor \
-        test test-throttle calibrate teleop
+.PHONY: help setup check detect sync-time tune clean build flash monitor \
+        test test-throttle calibrate teleop session
 
 help:            ## list targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  make %-14s %s\n", $$1, $$2}'
@@ -1386,6 +2100,9 @@ detect: $(PY)    ## find the ESP32 on USB, read chip id, query firmware
 
 sync-time: $(PY) ## set the ESP32 clock from this laptop
 	$(CLI) $(PORT_ARG) sync-time
+
+tune: $(PY)      ## push tuning.toml to the ESP32 and save it to flash
+	$(CLI) $(PORT_ARG) tune
 
 clean:           ## delete firmware/.pio build cache
 	rm -rf $(FW_DIR)/.pio
@@ -1410,11 +2127,19 @@ calibrate: $(PY) ## interactive servo center/left/right calibration
 
 teleop: $(PY)    ## keyboard driving: arrows = heading/speed
 	$(CLI) $(PORT_ARG) teleop
+
+session: $(PY)   ## interactive tuning/test session (test/esp32_session.py)
+	$(PY) test/esp32_session.py $(PORT_ARG)
 ```
+
+### `logs/.gitkeep`
+
+Empty file, so git tracks the folder.
 
 ### `.gitignore` (additions)
 
 ```text
 firmware/.pio/
 __pycache__/
+logs/*.jsonl
 ```
