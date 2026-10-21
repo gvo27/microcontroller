@@ -1,0 +1,80 @@
+# tuning.toml - the one place to tune the car without touching firmware.
+#
+#   make tune       push this file to the ESP32 and save it to its flash
+#   (every other make target also pushes it to ESP32 RAM on connect)
+#   make calibrate  writes [*.calibration] values back into this file on `save`
+#
+# Layout convention, per device:
+#   [device]               hand-tuned behaviour (limits, rates, gains)
+#   [device.calibration]   measured values for THIS car; written by tools
+#                          (make calibrate today, auto-calibration warm-up later)
+#   [warmup.device]        settings for that device's warm-up routine
+#
+# Keys must stay unique across the whole file (tools edit lines by key name).
+# Datasheet hard limits are enforced in firmware; out-of-range values are
+# clamped or rejected with an error.
+
+[link]                      # host <-> ESP32
+send_hz = 20                # command/heartbeat rate. Worst-case command delay = 1000/send_hz ms
+telemetry_hz = 10           # TEL lines from the ESP32, 0..50
+
+[control]
+control_hz = 100            # firmware control loop, 20..500. Keep >= servo_hz to use faster frames
+
+[safety]
+cmd_timeout_ms = 300        # no command for this long -> disarm. Keep >= 3 x (1000/send_hz)
+
+[steering]                  # DS3225 servo on GPIO4
+servo_hz = 50               # PWM frame rate, 50..330. 50 Hz = 20 ms frame; 200 Hz = 5 ms
+heading_gain = 1.0          # steering deg per heading deg (+ = left)
+
+[steering.calibration]
+center_us = 1500            # pulse for straight wheels
+left_us = 1800              # pulse at full LEFT lock
+right_us = 1200             # pulse at full RIGHT lock
+max_steer_deg = 25.0        # road-wheel angle at full lock (measured)
+
+[throttle]                  # THW-1060 ESC on GPIO5
+esc_hz = 50                 # 50 is the RC standard. Only raise after confirming the ESC accepts it
+speed_limit = 0.30          # speed 1.0 -> 30 % throttle (bench safety)
+accel_per_s = 2.0           # max change of speed command per second (slew limit)
+reverse_double_tap = true   # ESC needs brake -> neutral -> reverse (Fwd/Br/Rev mode)
+brake_ms = 150
+gap_ms = 150
+brake_level = 0.5
+
+[throttle.calibration]
+esc_min_us = 1000           # full reverse/brake
+esc_neutral_us = 1500       # must match what the ESC learned at power-on
+esc_max_us = 2000           # full forward
+deadband_us = 0             # ESC dead zone skipped around neutral
+
+[logging]
+enabled = true
+dir = "logs"
+log_heartbeats = true       # false = log D commands only when heading/speed change
+
+# ---------------------------------------------------------------------------
+# Reserved sections: intentionally empty until the hardware/routine exists and
+# its parameters are confirmed. Read by nothing yet.
+# ---------------------------------------------------------------------------
+
+[warmup]
+# suggested tenants: which routines run at startup and in what order, settle
+# times, sweep step sizes, pass/fail tolerances. Per-device routines go in
+# [warmup.steering], [warmup.throttle], [warmup.imu], ...; results are written
+# to the matching [*.calibration] table.
+
+[battery]
+# suggested tenants: low-signal input polarity, debounce
+
+[imu]
+# suggested tenants: sample rate, ranges, filter settings
+# [imu.calibration]: biases, mounting orientation
+
+[distance]
+# suggested tenants: sensor selection, sample rate, emergency-brake thresholds
+
+[encoder]
+# suggested tenants: sample rate, filtering
+# [encoder.calibration]: ticks per revolution, wheel diameter, gear ratio
