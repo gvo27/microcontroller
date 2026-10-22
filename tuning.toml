@@ -26,17 +26,17 @@ cmd_timeout_ms = 300        # no command for this long -> disarm. Keep >= 3 x (1
 
 [steering]                  # DS3225 servo on GPIO4
 servo_hz = 50               # PWM frame rate, 50..330. 50 Hz = 20 ms frame; 200 Hz = 5 ms
-heading_gain = 1.0          # steering deg per heading deg (+ = left)
+heading_gain = 2.0          # steering deg per heading deg (+ = left)
 
 [steering.calibration]
 center_us = 1500            # pulse for straight wheels
-left_us = 1800              # pulse at full LEFT lock
-right_us = 1200             # pulse at full RIGHT lock
+left_us = 1200              # pulse at full LEFT lock
+right_us = 1800             # pulse at full RIGHT lock
 max_steer_deg = 25.0        # road-wheel angle at full lock (measured)
 
 [throttle]                  # THW-1060 ESC on GPIO5
 esc_hz = 50                 # 50 is the RC standard. Only raise after confirming the ESC accepts it
-speed_limit = 0.30          # speed 1.0 -> 30 % throttle (bench safety)
+speed_limit = 0.40          # speed 1.0 -> 30 % throttle (bench safety), speed limit affects fwd vs reverse differently
 accel_per_s = 2.0           # max change of speed command per second (slew limit)
 reverse_double_tap = true   # ESC needs brake -> neutral -> reverse (Fwd/Br/Rev mode)
 brake_ms = 150
@@ -44,7 +44,7 @@ gap_ms = 150
 brake_level = 0.5
 
 [throttle.calibration]
-esc_min_us = 1000           # full reverse/brake
+esc_min_us = 1000            # full reverse/brake
 esc_neutral_us = 1500       # must match what the ESC learned at power-on
 esc_max_us = 2000           # full forward
 deadband_us = 0             # ESC dead zone skipped around neutral
