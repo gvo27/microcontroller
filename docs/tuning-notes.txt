@@ -1,0 +1,15 @@
+interactive tuning session on BENCH:
+
+center heading is a bit left offset, may require manual calibration
+heading of -5 is sometimes straight, sometimes right
+currently -15 to +5 is the steering capability
+either needs less slop in steering linkage or higher resolution in the tuning software
+
+speed of +-.3 triggers audio cue on the esc 
+speed of +.4 begins moving fwd
+speed of -.5 begins moving reverse
+need more resolution from +.4 to +.6 on bench
+
+disclaimer: these are bench tuning observations. 
+this could all change with wheels on ground and gear weight. 
+need to consider steering force at diff speeds.

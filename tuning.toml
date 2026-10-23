@@ -32,11 +32,11 @@ heading_gain = 2.0          # steering deg per heading deg (+ = left)
 center_us = 1500            # pulse for straight wheels
 left_us = 1200              # pulse at full LEFT lock
 right_us = 1800             # pulse at full RIGHT lock
-max_steer_deg = 25.0        # road-wheel angle at full lock (measured)
+max_steer_deg = 30.0        # road-wheel angle at full lock (measured)
 
 [throttle]                  # THW-1060 ESC on GPIO5
 esc_hz = 50                 # 50 is the RC standard. Only raise after confirming the ESC accepts it
-speed_limit = 0.40          # speed 1.0 -> 30 % throttle (bench safety), speed limit affects fwd vs reverse differently
+speed_limit = 0.45          # speed 1.0 -> 30 % throttle (bench safety), speed limit affects fwd vs reverse differently
 accel_per_s = 2.0           # max change of speed command per second (slew limit)
 reverse_double_tap = true   # ESC needs brake -> neutral -> reverse (Fwd/Br/Rev mode)
 brake_ms = 150
